@@ -21,6 +21,13 @@
 // LED
 #define LED_BLINK_INTERVAL 500 // ms
 
+// Serial baud rates
+#define USB_SERIAL_BAUD 921600
+#define UART2_BAUD 921600
+
+// USB Serial -> UART2 bridge
+#define USB_MSG_BUF_SIZE 128
+
 // ─── Ring Buffers (ISR → main) ─────────────────────────────
 #define BUF_SIZE 512
 
@@ -33,6 +40,9 @@ static volatile uint16_t spiHead = 0;
 static volatile uint16_t spiTail = 0;
 
 static uint32_t ledLastToggle = 0;
+static char usbMsgBuf[USB_MSG_BUF_SIZE];
+static size_t usbMsgLen = 0;
+static bool usbMsgOverflow = false;
 
 // ─── Callbacks ─────────────────────────────────────────────
 void onI2CReceive(int numBytes)
@@ -73,6 +83,32 @@ static void printByte(const char *tag, uint8_t b)
   Serial.println();
 }
 
+static void flushUsbMessage()
+{
+  if (usbMsgOverflow)
+  {
+    Serial.println("[USB]   message too long, discarded");
+    usbMsgLen = 0;
+    usbMsgOverflow = false;
+    return;
+  }
+
+  if (usbMsgLen == 0)
+  {
+    return;
+  }
+
+  Serial.print("[USB->UART2] ");
+  Serial.write(reinterpret_cast<const uint8_t *>(usbMsgBuf), usbMsgLen);
+  Serial.println();
+
+  Serial2.write(reinterpret_cast<const uint8_t *>(usbMsgBuf), usbMsgLen);
+  Serial2.write('\r');
+  Serial2.write('\n');
+
+  usbMsgLen = 0;
+}
+
 // ─── Setup ─────────────────────────────────────────────────
 void setup()
 {
@@ -80,7 +116,7 @@ void setup()
   pinMode(LED_BUILTIN, OUTPUT);
 
   // USB Serial (output)
-  Serial.begin(115200);
+  Serial.begin(USB_SERIAL_BAUD);
   while (!Serial && millis() < 3000)
     ;
 
@@ -91,8 +127,9 @@ void setup()
   // UART2 (Serial2)
   Serial2.setTX(UART2_TX_PIN);
   Serial2.setRX(UART2_RX_PIN);
-  Serial2.begin(115200);
-  Serial.printf("  UART2  : TX=GP%d  RX=GP%d  115200 baud\n", UART2_TX_PIN, UART2_RX_PIN);
+  Serial2.begin(UART2_BAUD);
+  Serial.printf("  UART2  : TX=GP%d  RX=GP%d  %lu baud\n",
+                UART2_TX_PIN, UART2_RX_PIN, (unsigned long)UART2_BAUD);
 
   // I2C Slave
   Wire.setSDA(I2C_SDA_PIN);
@@ -148,10 +185,34 @@ void loop()
     printByte("[SPI]  ", b);
   }
 
-  // Echo USB Serial
+  // Echo USB Serial locally and forward CR-terminated messages to UART2.
   while (Serial.available())
   {
     uint8_t b = Serial.read();
     Serial.write(b);
+
+    if (b == '\n')
+    {
+      continue;
+    }
+
+    if (b == '\r')
+    {
+      flushUsbMessage();
+      continue;
+    }
+
+    if (usbMsgOverflow)
+    {
+      continue;
+    }
+
+    if (usbMsgLen >= USB_MSG_BUF_SIZE - 1)
+    {
+      usbMsgOverflow = true;
+      continue;
+    }
+
+    usbMsgBuf[usbMsgLen++] = static_cast<char>(b);
   }
 }

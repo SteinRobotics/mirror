@@ -39,3 +39,7 @@
 
 # debug information files
 *.dwo
+
+rpi-pico-pinout.svg
+.pio/
+.vscode/
