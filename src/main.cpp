@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPISlave.h>
+#include <hardware/gpio.h>
 
 // ─── Pin Definitions ───────────────────────────────────────
 // UART2 (Serial2 = UART1)
@@ -17,6 +18,12 @@
 #define SPI_CS_PIN 17
 #define SPI_SCK_PIN 18
 #define SPI_TX_PIN 19 // MISO (data to master)
+
+// Debug Pin (external task toggle)
+#define DEBUG_PIN 2
+#define DEBUG_REPORT_INTERVAL 500 // ms
+static constexpr uint32_t DBG_CYCLE_WARN_US = 110;
+static constexpr uint32_t DBG_LOAD_WARN_PERMILLE = 800; // 80.0%
 
 // LED
 #define LED_BLINK_INTERVAL 500 // ms
@@ -44,6 +51,17 @@ static char usbMsgBuf[USB_MSG_BUF_SIZE];
 static size_t usbMsgLen = 0;
 static bool usbMsgOverflow = false;
 
+static char uartRxBuf[BUF_SIZE];
+static size_t uartRxLen = 0;
+
+// Debug pin timing (ISR → main)
+static volatile uint32_t dbgLastRiseUs = 0;
+static volatile uint32_t dbgLastPeriodUs = 0;
+static volatile uint32_t dbgMaxCycleUs = 0;      // max cycle time (rise-to-rise)
+static volatile uint32_t dbgMaxLoadPermille = 0; // max load in 0.1% units
+static volatile bool dbgActive = false;
+static uint32_t dbgLastReport = 0;
+
 // ─── Callbacks ─────────────────────────────────────────────
 void onI2CReceive(int numBytes)
 {
@@ -68,6 +86,38 @@ void onSPIReceive(uint8_t *data, size_t len)
     {
       spiBuf[spiHead] = data[i];
       spiHead = next;
+    }
+  }
+}
+
+void onDebugPinIRQ(uint gpio, uint32_t events)
+{
+  uint32_t now = micros();
+  if (events & GPIO_IRQ_EDGE_RISE)
+  {
+    // Rising edge: measure cycle time (rise-to-rise)
+    if (dbgActive)
+    {
+      uint32_t cycle = now - dbgLastRiseUs;
+      dbgLastPeriodUs = cycle;
+      if (cycle > dbgMaxCycleUs)
+        dbgMaxCycleUs = cycle;
+    }
+    dbgLastRiseUs = now;
+    dbgActive = true;
+  }
+  if (events & GPIO_IRQ_EDGE_FALL)
+  {
+    // Falling edge: measure task duration (high time) -> load
+    if (dbgActive)
+    {
+      uint32_t taskUs = now - dbgLastRiseUs;
+      if (dbgLastPeriodUs > 0)
+      {
+        uint32_t load = taskUs * 1000 / dbgLastPeriodUs;
+        if (load > dbgMaxLoadPermille)
+          dbgMaxLoadPermille = load;
+      }
     }
   }
 }
@@ -148,6 +198,13 @@ void setup()
   Serial.printf("  SPI    : RX=GP%d  TX=GP%d  SCK=GP%d  CS=GP%d\n",
                 SPI_RX_PIN, SPI_TX_PIN, SPI_SCK_PIN, SPI_CS_PIN);
 
+  // Debug Pin (use Pico SDK for reliable edge detection)
+  gpio_init(DEBUG_PIN);
+  gpio_set_dir(DEBUG_PIN, GPIO_IN);
+  gpio_set_irq_enabled_with_callback(DEBUG_PIN,
+                                     GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &onDebugPinIRQ);
+  Serial.printf("  DEBUG  : GP%d (input, edge interrupt)\n", DEBUG_PIN);
+
   Serial.println();
   Serial.println("Ready - waiting for data ...");
   Serial.println();
@@ -166,7 +223,18 @@ void loop()
   // Mirror UART2
   while (Serial2.available())
   {
-    printByte("[UART2]", Serial2.read());
+    uint8_t b = Serial2.read();
+    if (b == '\r')
+    {
+      Serial.print("[UART] ");
+      Serial.write(reinterpret_cast<const uint8_t *>(uartRxBuf), uartRxLen);
+      Serial.println();
+      uartRxLen = 0;
+    }
+    else if (b != '\n' && uartRxLen < BUF_SIZE - 1)
+    {
+      uartRxBuf[uartRxLen++] = static_cast<char>(b);
+    }
   }
 
   // Mirror I2C
@@ -185,11 +253,29 @@ void loop()
     printByte("[SPI]  ", b);
   }
 
-  // Echo USB Serial locally and forward CR-terminated messages to UART2.
+  // Report debug pin timing every 500ms
+  if (millis() - dbgLastReport >= DEBUG_REPORT_INTERVAL)
+  {
+    dbgLastReport = millis();
+    noInterrupts();
+    uint32_t maxCyc = dbgMaxCycleUs;
+    uint32_t maxLd = dbgMaxLoadPermille;
+    dbgMaxCycleUs = 0;
+    dbgMaxLoadPermille = 0;
+    interrupts();
+    if (dbgActive && (maxCyc > DBG_CYCLE_WARN_US || maxLd > DBG_LOAD_WARN_PERMILLE))
+    {
+      Serial.printf("[DBG] max cycle=%luus  max load=%lu.%lu%%\n",
+                    (unsigned long)maxCyc,
+                    (unsigned long)(maxLd / 10),
+                    (unsigned long)(maxLd % 10));
+    }
+  }
+
+  // Forward CR-terminated messages to UART2.
   while (Serial.available())
   {
     uint8_t b = Serial.read();
-    Serial.write(b);
 
     if (b == '\n')
     {
